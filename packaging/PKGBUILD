@@ -1,0 +1,26 @@
+# Maintainer-friendly template for Arch-based systems.
+
+pkgname=xdotool-gui
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Lightweight frontend for xdotool"
+arch=('any')
+url="https://example.invalid/xdotool-gui"
+license=('GPL3')
+depends=('python' 'python-pyside6' 'xdotool')
+makedepends=('python-build' 'python-installer' 'python-wheel' 'python-setuptools')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$startdir/.."
+  python -m installer --destdir="$pkgdir" dist/*.whl
+
+  install -Dm644 packaging/xdotool-gui.desktop "$pkgdir/usr/share/applications/xdotool-gui.desktop"
+  install -Dm644 src/xdotool_gui/resources/icons/xdotool-gui.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/xdotool-gui.svg"
+}

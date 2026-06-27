@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=xdotool-gui
+Comment=Lightweight frontend for xdotool
+Exec=xdotool-gui
+Icon=xdotool-gui
+Terminal=false
+Categories=Utility;Development;
+Keywords=xdotool;automation;X11;Qt;PySide6;

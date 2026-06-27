@@ -1,0 +1,7 @@
+QMainWindow, QWidget {
+  background: #efefef;
+}
+
+QGroupBox {
+  font-weight: 600;
+}
