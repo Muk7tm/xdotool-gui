@@ -23,6 +23,31 @@ class CommandOrder(str, Enum):
     WEIGHTED = "weighted"
 
 
+class MacroActionKind(str, Enum):
+    RUN_SHELL = "run_shell"
+    RUN_PYTHON = "run_python_script"
+    MOUSE_MOVE = "mouse_move"
+    CLICK = "click"
+    DOUBLE_CLICK = "double_click"
+    RIGHT_CLICK = "right_click"
+    MIDDLE_CLICK = "middle_click"
+    MOUSE_DOWN = "mouse_down"
+    MOUSE_UP = "mouse_up"
+    DRAG = "drag"
+    SCROLL = "scroll"
+    KEY_PRESS = "key_press"
+    KEY_DOWN = "key_down"
+    KEY_UP = "key_up"
+    TEXT = "text"
+    WAIT = "wait"
+    WAIT_FOR_PIXEL = "wait_for_pixel"
+    WAIT_FOR_WINDOW = "wait_for_window"
+    COMMENT = "comment"
+    LABEL = "label"
+    GOTO_LABEL = "goto_label"
+    CONDITIONAL_JUMP = "conditional_jump"
+
+
 @dataclass(slots=True)
 class CommandSpec:
     argv: list[str]
@@ -47,10 +72,13 @@ class ExecutionResult:
 
 @dataclass(slots=True)
 class AutomationStep:
-    command: str
+    command: str = ""
+    action_type: str = MacroActionKind.RUN_SHELL.value
+    params: dict[str, Any] = field(default_factory=dict)
     delay_ms: int = 0
     repeat: int = 1
     enabled: bool = True
+    label: str = ""
 
 
 @dataclass(slots=True)
@@ -68,6 +96,14 @@ class ClickPosition:
     jitter_ms: int = 0
     loop: bool = False
     priority: int = 0
+    movement_style: str = "instant"
+    ellipse_radius_x: int = 0
+    ellipse_radius_y: int = 0
+    offset_radius_x: int = 0
+    offset_radius_y: int = 0
+    bezier_steps: int = 16
+    movement_speed_min_ms: int = 0
+    movement_speed_max_ms: int = 0
 
 
 @dataclass(slots=True)
@@ -81,6 +117,37 @@ class AutoClickerProfile:
     start_delay_ms: int = 0
     stop_delay_ms: int = 0
     total_clicks: int = 0
+    target_window: dict[str, Any] = field(default_factory=dict)
+    movement_style: str = "instant"
+    ellipse_radius_x: int = 0
+    ellipse_radius_y: int = 0
+    offset_radius_x: int = 0
+    offset_radius_y: int = 0
+    bezier_steps: int = 16
+    movement_speed_min_ms: int = 0
+    movement_speed_max_ms: int = 0
+
+
+@dataclass(slots=True)
+class WindowTarget:
+    window_id: str = ""
+    title: str = ""
+    wm_class: str = ""
+    regex: bool = False
+
+
+@dataclass(slots=True)
+class WindowInfo:
+    window_id: int
+    title: str
+    wm_class: str = ""
+    pid: int = 0
+    desktop: int = -1
+    x: int = 0
+    y: int = 0
+    width: int = 0
+    height: int = 0
+    mapped: bool = False
 
 
 @dataclass(slots=True)

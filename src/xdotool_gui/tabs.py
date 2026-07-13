@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QCursor
@@ -15,20 +16,26 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGridLayout,
     QGroupBox,
+    QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QFileDialog,
+    QInputDialog,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QPlainTextEdit,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QSplitter,
     QVBoxLayout,
     QWidget,
+    QMenu,
 )
 
 from .automation import MacroRunOptions, MacroRunner
@@ -49,7 +56,9 @@ from .command_builder import (
     window_state,
 )
 from .hotkey_registry import HOTKEY_ACTIONS, hotkey_defaults, normalize_hotkey_bindings
-from .models import AutoClickerProfile, AutomationStep, ClickPosition, CommandSpec, CommandOrder, HistoryEntry, PresetEntry
+from .models import AutoClickerProfile, AutomationStep, ClickPosition, CommandSpec, CommandOrder, HistoryEntry, MacroActionKind, PresetEntry, WindowInfo, WindowTarget
+from .services.recorder import MouseMacroRecorder
+from .services.x11 import X11Inspector, parse_color
 
 
 class BaseCommandTab(QWidget):
@@ -64,6 +73,58 @@ class BaseCommandTab(QWidget):
 
     def execute_direct(self) -> bool:
         return False
+
+
+MACRO_ACTION_LABELS: dict[str, str] = {
+    MacroActionKind.RUN_SHELL.value: "Run Shell Command",
+    MacroActionKind.RUN_PYTHON.value: "Run Python Script",
+    MacroActionKind.MOUSE_MOVE.value: "Mouse Move",
+    MacroActionKind.CLICK.value: "Click",
+    MacroActionKind.DOUBLE_CLICK.value: "Double Click",
+    MacroActionKind.RIGHT_CLICK.value: "Right Click",
+    MacroActionKind.MIDDLE_CLICK.value: "Middle Click",
+    MacroActionKind.MOUSE_DOWN.value: "Mouse Down",
+    MacroActionKind.MOUSE_UP.value: "Mouse Up",
+    MacroActionKind.DRAG.value: "Drag",
+    MacroActionKind.SCROLL.value: "Scroll",
+    MacroActionKind.KEY_PRESS.value: "Key Press",
+    MacroActionKind.KEY_DOWN.value: "Key Down",
+    MacroActionKind.KEY_UP.value: "Key Up",
+    MacroActionKind.TEXT.value: "Text Typing",
+    MacroActionKind.WAIT.value: "Wait",
+    MacroActionKind.WAIT_FOR_PIXEL.value: "Wait For Pixel",
+    MacroActionKind.WAIT_FOR_WINDOW.value: "Wait For Window",
+    MacroActionKind.COMMENT.value: "Comment",
+    MacroActionKind.LABEL.value: "Label",
+    MacroActionKind.GOTO_LABEL.value: "Goto Label",
+    MacroActionKind.CONDITIONAL_JUMP.value: "Conditional Jump",
+}
+
+MACRO_ACTIONS = list(MACRO_ACTION_LABELS.keys())
+
+
+def _json_text(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _safe_int(text: str, fallback: int = 0) -> int:
+    try:
+        return int(text.strip())
+    except Exception:
+        return fallback
+
+
+def _safe_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return fallback
+
+
+def _textish(value: Any) -> str:
+    if isinstance(value, bool):
+        return ""
+    return str(value).strip()
 
 
 class KeyboardTab(BaseCommandTab):
@@ -151,7 +212,8 @@ class MouseTab(BaseCommandTab):
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(0, 60000)
         self.window_id = QLineEdit()
-        self.capture_button = QPushButton("Capture Position")
+        self.capture_button = QPushButton("Record Position")
+        self.capture_button.setToolTip("Insert the current mouse position into the active fields.")
         self.location_label = QLabel("0, 0")
         self.timer = QTimer(self)
         self.timer.setInterval(250)
@@ -170,6 +232,7 @@ class MouseTab(BaseCommandTab):
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.capture_button)
         btn_row.addWidget(self.location_label)
+        btn_row.addWidget(QLabel("Hotkey: F8"))
         btn_box = QWidget()
         btn_box.setLayout(btn_row)
         box = QGroupBox("Mouse")
@@ -213,6 +276,8 @@ class MouseTab(BaseCommandTab):
 
 
 class WindowsTab(BaseCommandTab):
+    windowTargetChanged = Signal(dict)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.action_combo = QComboBox()
@@ -239,6 +304,8 @@ class WindowsTab(BaseCommandTab):
             "window_list",
         ])
         self.search_edit = QLineEdit()
+        self.class_edit = QLineEdit()
+        self.regex_edit = QLineEdit()
         self.window_id = QLineEdit()
         self.x_spin = QSpinBox()
         self.x_spin.setRange(-100000, 100000)
@@ -250,6 +317,45 @@ class WindowsTab(BaseCommandTab):
         self.h_spin.setRange(1, 200000)
         self.desktop_spin = QSpinBox()
         self.desktop_spin.setRange(0, 128)
+
+        self.refresh_button = QPushButton("Refresh Windows")
+        self.use_selected_button = QPushButton("Use Selected")
+        self.save_target_button = QPushButton("Save Target")
+        self.target_id = QLineEdit()
+        self.target_title = QLineEdit()
+        self.target_class = QLineEdit()
+        self.target_id.setReadOnly(True)
+        self.target_title.setReadOnly(True)
+        self.target_class.setReadOnly(True)
+        self.target_regex = QCheckBox("Regex")
+        self.target_regex.setEnabled(False)
+
+        self.windows_table = QTableWidget(0, 8)
+        self.windows_table.setHorizontalHeaderLabels(["ID", "Title", "Class", "PID", "Desktop", "X", "Y", "Size"])
+        self.windows_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.windows_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.windows_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        self.windows_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.windows_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+
+        filter_form = QFormLayout()
+        filter_form.addRow("Search title", self.search_edit)
+        filter_form.addRow("Search class", self.class_edit)
+        filter_form.addRow("Regex", self.regex_edit)
+        filter_box = QGroupBox("Window Browser")
+        filter_box.setLayout(filter_form)
+
+        target_form = QFormLayout()
+        target_form.addRow("Window id", self.target_id)
+        target_form.addRow("Title", self.target_title)
+        target_form.addRow("Class", self.target_class)
+        target_form.addRow("", self.target_regex)
+        target_box = QGroupBox("Target Window")
+        target_box.setLayout(target_form)
+
         form = QFormLayout()
         form.addRow("Action", self.action_combo)
         form.addRow("Search / term", self.search_edit)
@@ -259,21 +365,141 @@ class WindowsTab(BaseCommandTab):
         form.addRow("Width", self.w_spin)
         form.addRow("Height", self.h_spin)
         form.addRow("Desktop", self.desktop_spin)
-        box = QGroupBox("Windows")
-        box.setLayout(form)
+        action_box = QGroupBox("Window Actions")
+        action_box.setLayout(form)
+
+        top_buttons = QHBoxLayout()
+        for widget in [self.refresh_button, self.use_selected_button, self.save_target_button]:
+            top_buttons.addWidget(widget)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(box)
-        self.preview = QLabel()
+        layout.addWidget(filter_box)
+        layout.addWidget(self.windows_table)
+        layout.addLayout(top_buttons)
+        layout.addWidget(target_box)
+        layout.addWidget(action_box)
         layout.addWidget(self.preview)
-        for widget in [self.action_combo, self.search_edit, self.window_id, self.x_spin, self.y_spin, self.w_spin, self.h_spin, self.desktop_spin]:
+
+        for widget in [self.action_combo, self.search_edit, self.class_edit, self.regex_edit, self.window_id, self.x_spin, self.y_spin, self.w_spin, self.h_spin, self.desktop_spin]:
             if hasattr(widget, "textChanged"):
                 widget.textChanged.connect(lambda *_: self.commandChanged.emit())
             elif hasattr(widget, "currentTextChanged"):
                 widget.currentTextChanged.connect(lambda *_: self.commandChanged.emit())
             elif hasattr(widget, "valueChanged"):
                 widget.valueChanged.connect(lambda *_: self.commandChanged.emit())
+
+        self.refresh_button.clicked.connect(self.refresh_windows)
+        self.use_selected_button.clicked.connect(self._use_selected_window)
+        self.save_target_button.clicked.connect(self._save_target_window)
+        self.windows_table.itemSelectionChanged.connect(self._sync_selected_window)
+        self.windows_table.cellDoubleClicked.connect(lambda *_: self._save_target_window())
         self.commandChanged.connect(lambda: self.preview.setText(self.preview_command()))
         self.preview.setText(self.preview_command())
+        self.refresh_windows()
+
+    def refresh_windows(self) -> None:
+        inspector: X11Inspector | None = None
+        try:
+            inspector = X11Inspector()
+            windows = inspector.search_windows(
+                title=self.search_edit.text(),
+                wm_class=self.class_edit.text(),
+                regex=self.regex_edit.text(),
+            )
+        except Exception as exc:
+            self.windows_table.setRowCount(0)
+            self.preview.setText(f"Unable to list windows: {exc}")
+            return
+        finally:
+            if inspector is not None:
+                inspector.close()
+        self.windows_table.setRowCount(0)
+        for window in windows:
+            self._add_window_row(window)
+        self.preview.setText(f"{len(windows)} windows")
+        self.commandChanged.emit()
+
+    def _add_window_row(self, window: WindowInfo) -> None:
+        row = self.windows_table.rowCount()
+        self.windows_table.insertRow(row)
+        values = [
+            hex(window.window_id),
+            window.title,
+            window.wm_class,
+            str(window.pid),
+            str(window.desktop),
+            str(window.x),
+            str(window.y),
+            f"{window.width}x{window.height}",
+        ]
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setData(Qt.ItemDataRole.UserRole, window.window_id)
+            self.windows_table.setItem(row, col, item)
+
+    def _selected_window_info(self) -> WindowInfo | None:
+        row = self.windows_table.currentRow()
+        if row < 0:
+            return None
+        try:
+            return WindowInfo(
+                window_id=int(self.windows_table.item(row, 0).data(Qt.ItemDataRole.UserRole)),
+                title=self.windows_table.item(row, 1).text(),
+                wm_class=self.windows_table.item(row, 2).text(),
+                pid=_safe_int(self.windows_table.item(row, 3).text()),
+                desktop=_safe_int(self.windows_table.item(row, 4).text(), -1),
+                x=_safe_int(self.windows_table.item(row, 5).text()),
+                y=_safe_int(self.windows_table.item(row, 6).text()),
+                width=_safe_int(self.windows_table.item(row, 7).text().split("x")[0]),
+                height=_safe_int(self.windows_table.item(row, 7).text().split("x")[-1]),
+                mapped=True,
+            )
+        except Exception:
+            return None
+
+    def _sync_selected_window(self) -> None:
+        window = self._selected_window_info()
+        if window is None:
+            return
+        self.target_id.setText(hex(window.window_id))
+        self.target_title.setText(window.title)
+        self.target_class.setText(window.wm_class)
+        self.preview.setText(f"Selected window: {window.title or window.window_id}")
+        self.commandChanged.emit()
+
+    def selected_target(self) -> WindowTarget:
+        return WindowTarget(
+            window_id=self.target_id.text().strip(),
+            title=self.target_title.text().strip(),
+            wm_class=self.target_class.text().strip(),
+            regex=self.target_regex.isChecked(),
+        )
+
+    def set_target(self, target: dict[str, Any]) -> None:
+        self.target_id.setText(str(target.get("window_id", "")))
+        self.target_title.setText(str(target.get("title", "")))
+        self.target_class.setText(str(target.get("wm_class", "")))
+        self.target_regex.setChecked(bool(target.get("regex", False)))
+
+    def _use_selected_window(self) -> None:
+        window = self._selected_window_info()
+        if window is None:
+            QMessageBox.information(self, "Windows", "Select a window first.")
+            return
+        self.target_id.setText(hex(window.window_id))
+        self.target_title.setText(window.title)
+        self.target_class.setText(window.wm_class)
+        self.preview.setText(f"Target prepared: {window.title or window.window_id}")
+        self.commandChanged.emit()
+
+    def _save_target_window(self) -> None:
+        window = self._selected_window_info()
+        if window is None:
+            QMessageBox.information(self, "Windows", "Select a window first.")
+            return
+        self._use_selected_window()
+        self.windowTargetChanged.emit(asdict(self.selected_target()))
+        QMessageBox.information(self, "Windows", "Target window saved.")
 
     def command_spec(self) -> CommandSpec | None:
         action = self.action_combo.currentText()
@@ -436,6 +662,9 @@ class AutomationTab(BaseCommandTab):
         self.pause_button = QPushButton("Pause")
         self.resume_button = QPushButton("Resume")
         self.stop_button = QPushButton("Stop")
+        self.record_hint = QLabel("Record mouse moves and clicks into the macro table, then play them back in a loop.")
+        self.record_hint.setWordWrap(True)
+        self.recording_label = QLabel("Recorder idle")
         self.status = QLabel("idle")
         buttons = QHBoxLayout()
         for widget in [self.add_button, self.remove_button, self.up_button, self.down_button, self.start_button, self.pause_button, self.resume_button, self.stop_button]:
@@ -551,6 +780,737 @@ class AutomationTab(BaseCommandTab):
         return started
 
 
+class StructuredAutomationTab(BaseCommandTab):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Enabled", "Action", "Command / Label", "Params", "Delay ms", "Repeat"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.setDropIndicatorShown(True)
+        self.table.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+
+        self.macro_name = QLineEdit("Untitled macro")
+        self.repeat_spin = QSpinBox()
+        self.repeat_spin.setRange(1, 9999)
+        self.repeat_spin.setValue(1)
+        self.loop_forever = QCheckBox("Loop forever")
+        self.confirm_infinite = QCheckBox("Confirm infinite loops")
+        self.confirm_infinite.setChecked(True)
+        self.stop_on_error = QCheckBox("Stop on error")
+        self.continue_on_timeout = QCheckBox("Continue on timeout")
+        self.stop_on_window_loss = QCheckBox("Stop if target window vanishes")
+        self.stop_on_window_loss.setChecked(True)
+
+        self.delay_mode = QComboBox()
+        self.delay_mode.addItems(["fixed", "random", "gaussian", "humanized"])
+        self.fixed_delay = QSpinBox()
+        self.fixed_delay.setRange(0, 600000)
+        self.random_min = QSpinBox()
+        self.random_min.setRange(0, 600000)
+        self.random_max = QSpinBox()
+        self.random_max.setRange(0, 600000)
+        self.gaussian_mean = QSpinBox()
+        self.gaussian_mean.setRange(0, 600000)
+        self.gaussian_stdev = QSpinBox()
+        self.gaussian_stdev.setRange(0, 600000)
+        self.max_runtime = QSpinBox()
+        self.max_runtime.setRange(0, 1440)
+        self.max_failures = QSpinBox()
+        self.max_failures.setRange(0, 99999)
+        self.retry_count = QSpinBox()
+        self.retry_count.setRange(1, 25)
+        self.retry_count.setValue(3)
+        self.retry_delay = QSpinBox()
+        self.retry_delay.setRange(0, 5000)
+
+        self.target_id = QLineEdit()
+        self.target_title = QLineEdit()
+        self.target_class = QLineEdit()
+        self.target_regex = QCheckBox("Regex")
+        for widget in [self.target_id, self.target_title, self.target_class]:
+            widget.setReadOnly(True)
+        self.target_regex.setEnabled(False)
+
+        self.insert_combo = QComboBox()
+        self.insert_combo.addItems([MACRO_ACTION_LABELS[action] for action in MACRO_ACTIONS])
+        self.insert_button = QPushButton("Insert Action")
+        self.add_button = QPushButton("Add Step")
+        self.remove_button = QPushButton("Remove Step")
+        self.duplicate_button = QPushButton("Duplicate")
+        self.up_button = QPushButton("Up")
+        self.down_button = QPushButton("Down")
+        self.validate_button = QPushButton("Validate")
+        self.copy_button = QPushButton("Copy")
+        self.paste_button = QPushButton("Paste")
+        self.record_button = QPushButton("Record Mouse")
+        self.stop_record_button = QPushButton("Stop Recording")
+        self.stop_record_button.setEnabled(False)
+        self.record_button.setToolTip("Record mouse moves and clicks into the macro table.")
+        self.stop_record_button.setToolTip("Stop the mouse recorder.")
+        self.record_hint = QLabel("Use the recorder to capture mouse moves and clicks into the current macro.")
+        self.record_hint.setWordWrap(True)
+        self.recording_label = QLabel("Recorder idle")
+        self.save_button = QPushButton("Save Macro")
+        self.load_button = QPushButton("Load Macro")
+        self.import_button = QPushButton("Import")
+        self.export_button = QPushButton("Export")
+        self.start_button = QPushButton("Start")
+        self.pause_button = QPushButton("Pause")
+        self.resume_button = QPushButton("Resume")
+        self.stop_button = QPushButton("Stop")
+        for button, tip in [
+            (self.add_button, "Add a blank macro step."),
+            (self.insert_button, "Insert a step using the selected action type."),
+            (self.remove_button, "Delete the selected step."),
+            (self.duplicate_button, "Duplicate the selected step."),
+            (self.copy_button, "Copy selected steps as JSON."),
+            (self.paste_button, "Paste steps from JSON in the clipboard."),
+            (self.validate_button, "Validate the macro before running it."),
+            (self.start_button, "Run the macro."),
+            (self.pause_button, "Pause the running macro."),
+            (self.resume_button, "Resume a paused macro."),
+            (self.stop_button, "Stop the running macro."),
+        ]:
+            button.setToolTip(tip)
+
+        self.status = QLabel("idle")
+        self.progress = QProgressBar()
+        self.current_cycle = QLabel("0 / 0")
+        self.completed_actions = QLabel("0")
+        self.current_action = QLabel("idle")
+        self.macro_label = QLabel("Untitled macro")
+        self.elapsed_label = QLabel("0s")
+        self.average_label = QLabel("0s")
+        self.remaining_label = QLabel("-")
+        self.finish_label = QLabel("-")
+        self.percent_label = QLabel("-")
+
+        file_row = QHBoxLayout()
+        for widget in [self.save_button, self.load_button, self.import_button, self.export_button]:
+            file_row.addWidget(widget)
+        edit_row = QHBoxLayout()
+        for widget in [self.add_button, self.insert_combo, self.insert_button, self.remove_button, self.duplicate_button, self.copy_button, self.paste_button, self.up_button, self.down_button, self.validate_button]:
+            edit_row.addWidget(widget)
+        run_row = QHBoxLayout()
+        for widget in [self.start_button, self.pause_button, self.resume_button, self.stop_button]:
+            run_row.addWidget(widget)
+
+        macro_form = QFormLayout()
+        macro_form.addRow("Macro name", self.macro_name)
+        macro_form.addRow("Repeat", self.repeat_spin)
+        macro_form.addRow("", self.loop_forever)
+        macro_form.addRow("", self.confirm_infinite)
+        macro_form.addRow("", self.stop_on_error)
+        macro_form.addRow("", self.continue_on_timeout)
+        macro_form.addRow("", self.stop_on_window_loss)
+        macro_form.addRow("Delay mode", self.delay_mode)
+        macro_form.addRow("Fixed delay ms", self.fixed_delay)
+        macro_form.addRow("Random min ms", self.random_min)
+        macro_form.addRow("Random max ms", self.random_max)
+        macro_form.addRow("Gaussian mean ms", self.gaussian_mean)
+        macro_form.addRow("Gaussian stdev ms", self.gaussian_stdev)
+        macro_form.addRow("Max runtime minutes", self.max_runtime)
+        macro_form.addRow("Max failures", self.max_failures)
+        macro_form.addRow("Retries", self.retry_count)
+        macro_form.addRow("Retry delay ms", self.retry_delay)
+        macro_box = QGroupBox("Macro Settings")
+        macro_box.setLayout(macro_form)
+
+        target_form = QFormLayout()
+        target_form.addRow("Target id", self.target_id)
+        target_form.addRow("Target title", self.target_title)
+        target_form.addRow("Target class", self.target_class)
+        target_form.addRow("", self.target_regex)
+        target_box = QGroupBox("Window Target")
+        target_box.setLayout(target_form)
+
+        progress_form = QGridLayout()
+        progress_form.addWidget(QLabel("Macro"), 0, 0)
+        progress_form.addWidget(self.macro_label, 0, 1)
+        progress_form.addWidget(QLabel("Cycle"), 1, 0)
+        progress_form.addWidget(self.current_cycle, 1, 1)
+        progress_form.addWidget(QLabel("Completed actions"), 2, 0)
+        progress_form.addWidget(self.completed_actions, 2, 1)
+        progress_form.addWidget(QLabel("Current action"), 3, 0)
+        progress_form.addWidget(self.current_action, 3, 1)
+        progress_form.addWidget(QLabel("Elapsed"), 4, 0)
+        progress_form.addWidget(self.elapsed_label, 4, 1)
+        progress_form.addWidget(QLabel("Average cycle"), 5, 0)
+        progress_form.addWidget(self.average_label, 5, 1)
+        progress_form.addWidget(QLabel("Remaining"), 6, 0)
+        progress_form.addWidget(self.remaining_label, 6, 1)
+        progress_form.addWidget(QLabel("Finish"), 7, 0)
+        progress_form.addWidget(self.finish_label, 7, 1)
+        progress_form.addWidget(QLabel("Progress"), 8, 0)
+        progress_form.addWidget(self.percent_label, 8, 1)
+        progress_box = QGroupBox("Progress")
+        progress_box.setLayout(progress_form)
+
+        settings_widget = QWidget()
+        settings_layout = QVBoxLayout(settings_widget)
+        settings_layout.addWidget(target_box)
+        settings_layout.addWidget(macro_box)
+        settings_layout.addWidget(self.record_hint)
+        settings_layout.addWidget(self.record_button)
+        settings_layout.addWidget(self.stop_record_button)
+        settings_layout.addWidget(self.recording_label)
+        settings_layout.addStretch(1)
+
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        settings_scroll.setWidget(settings_widget)
+        settings_scroll.setMinimumHeight(180)
+
+        editor_widget = QWidget()
+        editor_layout = QVBoxLayout(editor_widget)
+        editor_layout.addWidget(self.table)
+        editor_layout.addLayout(edit_row)
+        editor_layout.addLayout(file_row)
+        editor_layout.addLayout(run_row)
+        editor_layout.addWidget(self.progress)
+        editor_layout.addWidget(progress_box)
+        editor_layout.addWidget(self.status)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(settings_scroll)
+        splitter.addWidget(editor_widget)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        self.table.setMinimumHeight(220)
+        progress_box.setMinimumHeight(160)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(splitter)
+
+        self.runner = MacroRunner(self)
+        self.recorder = MouseMacroRecorder(self)
+        self.runner.logMessage.connect(self._set_status)
+        self.runner.stateChanged.connect(self.status.setText)
+        self.runner.progressChanged.connect(self._update_progress)
+        self.runner.failureCountChanged.connect(lambda count: self.status.setText(f"Failures: {count}"))
+        self.recorder.stepRecorded.connect(self._append_recorded_step)
+        self.recorder.stateChanged.connect(self.recording_label.setText)
+        self.recorder.error.connect(lambda message: QMessageBox.warning(self, "Recorder", message))
+
+        self.add_button.clicked.connect(lambda: self.add_step())
+        self.insert_button.clicked.connect(lambda: self.add_step(action_type=self._selected_action_type()))
+        self.remove_button.clicked.connect(self.remove_step)
+        self.duplicate_button.clicked.connect(self.duplicate_step)
+        self.up_button.clicked.connect(lambda: self.shift_step(-1))
+        self.down_button.clicked.connect(lambda: self.shift_step(1))
+        self.validate_button.clicked.connect(lambda: self.validate_macro(show_dialog=True))
+        self.copy_button.clicked.connect(self.copy_selected_steps)
+        self.paste_button.clicked.connect(self.paste_steps)
+        self.record_button.clicked.connect(self.start_recording)
+        self.stop_record_button.clicked.connect(self.stop_recording)
+        self.save_button.clicked.connect(self.save_macro)
+        self.load_button.clicked.connect(self.load_macro)
+        self.import_button.clicked.connect(self.import_macro)
+        self.export_button.clicked.connect(self.export_macro)
+        self.start_button.clicked.connect(self.execute_direct)
+        self.pause_button.clicked.connect(self.runner.pause)
+        self.resume_button.clicked.connect(self.runner.resume)
+        self.stop_button.clicked.connect(self.runner.stop)
+        self.table.itemChanged.connect(lambda *_: self.commandChanged.emit())
+        self.table.itemSelectionChanged.connect(lambda *_: self.commandChanged.emit())
+        self.table.customContextMenuRequested.connect(self._show_table_menu)
+        for widget in [self.macro_name, self.repeat_spin, self.loop_forever, self.confirm_infinite, self.stop_on_error, self.continue_on_timeout, self.stop_on_window_loss, self.delay_mode, self.fixed_delay, self.random_min, self.random_max, self.gaussian_mean, self.gaussian_stdev, self.max_runtime, self.max_failures, self.retry_count, self.retry_delay]:
+            if hasattr(widget, "textChanged"):
+                widget.textChanged.connect(lambda *_: self.commandChanged.emit())
+            elif hasattr(widget, "currentTextChanged"):
+                widget.currentTextChanged.connect(lambda *_: self.commandChanged.emit())
+            elif hasattr(widget, "valueChanged"):
+                widget.valueChanged.connect(lambda *_: self.commandChanged.emit())
+            elif hasattr(widget, "stateChanged"):
+                widget.stateChanged.connect(lambda *_: self.commandChanged.emit())
+        self.commandChanged.connect(self._refresh_preview)
+        self.add_step()
+        self._refresh_preview()
+
+    def _set_status(self, text: str) -> None:
+        self.status.setText(text)
+
+    def _selected_action_type(self) -> str:
+        index = self.insert_combo.currentIndex()
+        if 0 <= index < len(MACRO_ACTIONS):
+            return MACRO_ACTIONS[index]
+        return MacroActionKind.RUN_SHELL.value
+
+    def _action_combo(self, action_type: str) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems([MACRO_ACTION_LABELS[action] for action in MACRO_ACTIONS])
+        combo.setCurrentIndex(MACRO_ACTIONS.index(action_type) if action_type in MACRO_ACTIONS else 0)
+        combo.currentIndexChanged.connect(lambda *_: self.commandChanged.emit())
+        return combo
+
+    def _default_template(self, action_type: str) -> tuple[str, dict[str, Any], str]:
+        templates: dict[str, tuple[str, dict[str, Any], str]] = {
+            MacroActionKind.RUN_SHELL.value: ("xdotool mousemove 100 100", {"command": "xdotool mousemove 100 100"}, "Shell command"),
+            MacroActionKind.RUN_PYTHON.value: ("", {"script": "print('hello')"}, "Python script"),
+            MacroActionKind.MOUSE_MOVE.value: ("", {"x": 100, "y": 100, "movement_style": "smooth", "bezier_steps": 16}, "Mouse move"),
+            MacroActionKind.CLICK.value: ("", {"button": 1, "clicks": 1}, "Click"),
+            MacroActionKind.DOUBLE_CLICK.value: ("", {"button": 1, "clicks": 2}, "Double click"),
+            MacroActionKind.RIGHT_CLICK.value: ("", {"button": 3, "clicks": 1}, "Right click"),
+            MacroActionKind.MIDDLE_CLICK.value: ("", {"button": 2, "clicks": 1}, "Middle click"),
+            MacroActionKind.MOUSE_DOWN.value: ("", {"button": 1}, "Mouse down"),
+            MacroActionKind.MOUSE_UP.value: ("", {"button": 1}, "Mouse up"),
+            MacroActionKind.DRAG.value: ("", {"start_x": 100, "start_y": 100, "end_x": 300, "end_y": 300, "button": 1, "bezier_steps": 16}, "Drag"),
+            MacroActionKind.SCROLL.value: ("", {"direction": "up", "amount": 1}, "Scroll"),
+            MacroActionKind.KEY_PRESS.value: ("", {"key": "ctrl+s", "repeat": 1, "delay_ms": 0}, "Key press"),
+            MacroActionKind.KEY_DOWN.value: ("", {"key": "ctrl"}, "Key down"),
+            MacroActionKind.KEY_UP.value: ("", {"key": "ctrl"}, "Key up"),
+            MacroActionKind.TEXT.value: ("", {"text": "Hello world", "delay_ms": 0, "clearmodifiers": False}, "Text typing"),
+            MacroActionKind.WAIT.value: ("", {"timeout_ms": 1000}, "Wait"),
+            MacroActionKind.WAIT_FOR_PIXEL.value: ("", {"x": 100, "y": 100, "color": "#ffffff", "tolerance": 10, "poll_interval_ms": 100, "timeout_ms": 10000, "continue_on_timeout": False}, "Wait for pixel"),
+            MacroActionKind.WAIT_FOR_WINDOW.value: ("", {"title": "", "class": "", "regex": "", "timeout_ms": 10000, "continue_on_timeout": False}, "Wait for window"),
+            MacroActionKind.COMMENT.value: ("Comment", {"text": ""}, "Comment"),
+            MacroActionKind.LABEL.value: ("Label", {"label": "start"}, "Label"),
+            MacroActionKind.GOTO_LABEL.value: ("", {"label": "start"}, "Goto label"),
+            MacroActionKind.CONDITIONAL_JUMP.value: ("", {"condition": "", "true_label": "", "false_label": ""}, "Conditional jump"),
+        }
+        return templates.get(action_type, templates[MacroActionKind.RUN_SHELL.value])
+
+    def add_step(self, step: AutomationStep | None = None, action_type: str | None = None) -> None:
+        action = (step.action_type if step is not None else action_type) or MacroActionKind.RUN_SHELL.value
+        command, params, label = self._default_template(action)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        enabled = QTableWidgetItem("")
+        enabled.setFlags(enabled.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        enabled.setCheckState(Qt.CheckState.Checked if (step.enabled if step is not None else True) else Qt.CheckState.Unchecked)
+        self.table.setItem(row, 0, enabled)
+        self.table.setCellWidget(row, 1, self._action_combo(action))
+        command_item = QTableWidgetItem(step.command if step is not None else command)
+        command_item.setData(Qt.ItemDataRole.UserRole, step.label if step is not None else label)
+        self.table.setItem(row, 2, command_item)
+        self.table.setItem(row, 3, QTableWidgetItem(_json_text(step.params if step is not None else params)))
+        self.table.setItem(row, 4, QTableWidgetItem(str(step.delay_ms if step is not None else 0)))
+        self.table.setItem(row, 5, QTableWidgetItem(str(step.repeat if step is not None else 1)))
+        self.commandChanged.emit()
+
+    def _current_action_type(self, row: int) -> str:
+        widget = self.table.cellWidget(row, 1)
+        if isinstance(widget, QComboBox):
+            index = widget.currentIndex()
+            if 0 <= index < len(MACRO_ACTIONS):
+                return MACRO_ACTIONS[index]
+        return MacroActionKind.RUN_SHELL.value
+
+    def _parse_params(self, text: str, *, strict: bool = False) -> dict[str, Any]:
+        if not text.strip():
+            return {}
+        try:
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise ValueError("Params must be a JSON object.")
+            return parsed
+        except Exception:
+            if strict:
+                raise
+            return {}
+
+    def step_at(self, row: int) -> AutomationStep:
+        enabled = self.table.item(row, 0).checkState() == Qt.CheckState.Checked if self.table.item(row, 0) else True
+        command_item = self.table.item(row, 2)
+        params_item = self.table.item(row, 3)
+        delay_item = self.table.item(row, 4)
+        repeat_item = self.table.item(row, 5)
+        return AutomationStep(
+            command=command_item.text().strip() if command_item else "",
+            action_type=self._current_action_type(row),
+            params=self._parse_params(params_item.text()) if params_item else {},
+            delay_ms=_safe_int(delay_item.text(), 0) if delay_item else 0,
+            repeat=max(_safe_int(repeat_item.text(), 1), 1) if repeat_item else 1,
+            enabled=enabled,
+            label=str(command_item.data(Qt.ItemDataRole.UserRole) or "") if command_item else "",
+        )
+
+    def steps(self) -> list[AutomationStep]:
+        return [self.step_at(row) for row in range(self.table.rowCount())]
+
+    def _write_step(self, row: int, step: AutomationStep) -> None:
+        self.table.item(row, 0).setCheckState(Qt.CheckState.Checked if step.enabled else Qt.CheckState.Unchecked)
+        widget = self.table.cellWidget(row, 1)
+        if isinstance(widget, QComboBox):
+            widget.setCurrentIndex(MACRO_ACTIONS.index(step.action_type) if step.action_type in MACRO_ACTIONS else 0)
+        self.table.item(row, 2).setText(step.command)
+        self.table.item(row, 2).setData(Qt.ItemDataRole.UserRole, step.label)
+        self.table.item(row, 3).setText(_json_text(step.params))
+        self.table.item(row, 4).setText(str(step.delay_ms))
+        self.table.item(row, 5).setText(str(step.repeat))
+
+    def remove_step(self) -> None:
+        row = self.table.currentRow()
+        if row >= 0:
+            self.table.removeRow(row)
+            self.commandChanged.emit()
+
+    def duplicate_step(self) -> None:
+        row = self.table.currentRow()
+        if row >= 0:
+            self.add_step(self.step_at(row))
+
+    def shift_step(self, direction: int) -> None:
+        row = self.table.currentRow()
+        other = row + direction
+        if row < 0 or other < 0 or other >= self.table.rowCount():
+            return
+        current = self.step_at(row)
+        swap = self.step_at(other)
+        self._write_step(row, swap)
+        self._write_step(other, current)
+        self.table.setCurrentCell(other, 0)
+        self.commandChanged.emit()
+
+    def _validate_step(self, step: AutomationStep) -> list[str]:
+        errors: list[str] = []
+        params = step.params or {}
+        if step.delay_ms < 0:
+            errors.append("Delay cannot be negative.")
+        if step.repeat < 1:
+            errors.append("Repeat must be at least 1.")
+        if step.action_type == MacroActionKind.WAIT_FOR_PIXEL.value:
+            try:
+                parse_color(str(params.get("color", "#000000")))
+            except Exception as exc:
+                errors.append(str(exc))
+            for key in ["x", "y", "tolerance", "poll_interval_ms", "timeout_ms"]:
+                if key not in params:
+                    errors.append(f"Missing {key} for wait_for_pixel.")
+        if step.action_type == MacroActionKind.WAIT_FOR_WINDOW.value and not any(_textish(params.get(key, "")) for key in ["title", "class", "wm_class", "regex"]):
+            errors.append("Wait for window needs a title, class, or regex.")
+        if step.action_type == MacroActionKind.GOTO_LABEL.value and not str(params.get("label", step.command)).strip():
+            errors.append("Goto label needs a label target.")
+        if step.action_type == MacroActionKind.LABEL.value and not str(step.label or params.get("label", step.command)).strip():
+            errors.append("Label needs a name.")
+        return errors
+
+    def validate_macro(self, show_dialog: bool = False) -> list[str]:
+        errors: list[str] = []
+        for row_index in range(self.table.rowCount()):
+            params_item = self.table.item(row_index, 3)
+            if params_item is not None:
+                try:
+                    self._parse_params(params_item.text(), strict=True)
+                except Exception as exc:
+                    errors.append(f"Row {row_index + 1}: invalid params JSON: {exc}")
+            step = self.step_at(row_index)
+            for error in self._validate_step(step):
+                errors.append(f"Row {row_index + 1}: {error}")
+        if show_dialog:
+            if errors:
+                QMessageBox.warning(self, "Macro Validation", "\n".join(errors))
+            else:
+                QMessageBox.information(self, "Macro Validation", "No validation errors were found.")
+        return errors
+
+    def _macro_options(self) -> MacroRunOptions:
+        target = self.target_window()
+        return MacroRunOptions(
+            repeat=self.repeat_spin.value(),
+            loop_forever=self.loop_forever.isChecked(),
+            stop_on_error=self.stop_on_error.isChecked(),
+            delay_mode=self.delay_mode.currentText(),
+            fixed_delay_ms=self.fixed_delay.value(),
+            random_delay_min_ms=self.random_min.value(),
+            random_delay_max_ms=self.random_max.value(),
+            gaussian_mean_ms=self.gaussian_mean.value(),
+            gaussian_stdev_ms=self.gaussian_stdev.value(),
+            max_runtime_minutes=self.max_runtime.value(),
+            max_failures=self.max_failures.value(),
+            retry_count=self.retry_count.value(),
+            retry_delay_ms=self.retry_delay.value(),
+            continue_on_timeout=self.continue_on_timeout.isChecked(),
+            confirm_infinite_loops=self.confirm_infinite.isChecked(),
+            target_window=target if any([target.window_id, target.title, target.wm_class]) else None,
+            stop_on_window_loss=self.stop_on_window_loss.isChecked(),
+            macro_name=self.macro_name.text().strip() or "Untitled macro",
+        )
+
+    def target_window(self) -> WindowTarget:
+        return WindowTarget(
+            window_id=self.target_id.text().strip(),
+            title=self.target_title.text().strip(),
+            wm_class=self.target_class.text().strip(),
+            regex=self.target_regex.isChecked(),
+        )
+
+    def set_target_window(self, target: dict[str, Any]) -> None:
+        self.target_id.setText(str(target.get("window_id", "")))
+        self.target_title.setText(str(target.get("title", "")))
+        self.target_class.setText(str(target.get("wm_class", "")))
+        self.target_regex.setChecked(bool(target.get("regex", False)))
+
+    def set_progress(self, payload: dict[str, Any]) -> None:
+        cycle = int(payload.get("cycle", 0))
+        total_cycles = int(payload.get("total_cycles", 0))
+        completed = int(payload.get("completed_actions", 0))
+        current_action = str(payload.get("current_action", "idle"))
+        macro_name = str(payload.get("macro_name", self.macro_name.text()))
+        elapsed = float(payload.get("elapsed_seconds", 0.0))
+        average = float(payload.get("average_cycle_seconds", 0.0))
+        remaining = payload.get("remaining_seconds")
+        finish = str(payload.get("finish_time", "-"))
+        percent = payload.get("percent")
+        self.current_cycle.setText(f"{cycle} / {total_cycles}" if total_cycles else str(cycle))
+        self.completed_actions.setText(str(completed))
+        self.current_action.setText(current_action)
+        self.macro_label.setText(macro_name)
+        self.elapsed_label.setText(self._format_seconds(elapsed))
+        self.average_label.setText(self._format_seconds(average))
+        self.remaining_label.setText(self._format_seconds(float(remaining))) if remaining is not None else self.remaining_label.setText("-")
+        self.finish_label.setText(finish)
+        self.percent_label.setText(f"{percent:.1f}%" if isinstance(percent, (int, float)) else "-")
+        if isinstance(percent, (int, float)):
+            self.progress.setRange(0, 100)
+            self.progress.setValue(int(percent))
+        else:
+            self.progress.setRange(0, 0)
+
+    def _update_progress(self, payload: object) -> None:
+        if isinstance(payload, dict):
+            self.set_progress(payload)
+
+    def preview_command(self) -> str:
+        enabled = len([step for step in self.steps() if step.enabled])
+        return f"Macro {self.macro_name.text().strip() or 'Untitled macro'}: {enabled} enabled actions"
+
+    def command_spec(self) -> CommandSpec | None:
+        enabled = [step for step in self.steps() if step.enabled and step.command]
+        if not enabled:
+            return None
+        return raw_command(enabled[0].command)
+
+    def _refresh_preview(self) -> None:
+        self.status.setText(self.preview_command())
+        self.macro_label.setText(self.macro_name.text().strip() or "Untitled macro")
+
+    def _selected_rows(self) -> list[int]:
+        rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        return rows
+
+    def _show_table_menu(self, pos) -> None:
+        menu = QMenu(self)
+        menu.addAction("Add Step", self.add_step)
+        menu.addAction("Insert Selected", lambda: self.add_step(action_type=self._selected_action_type()))
+        menu.addAction("Duplicate", self.duplicate_step)
+        menu.addAction("Copy", self.copy_selected_steps)
+        menu.addAction("Paste", self.paste_steps)
+        menu.addSeparator()
+        menu.addAction("Remove", self.remove_step)
+        menu.addAction("Move Up", lambda: self.shift_step(-1))
+        menu.addAction("Move Down", lambda: self.shift_step(1))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def copy_selected_steps(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        payload = [asdict(self.step_at(row)) for row in rows]
+        QApplication.clipboard().setText(json.dumps(payload, indent=2, ensure_ascii=False))
+        self.status.setText("Copied selected steps")
+
+    def paste_steps(self) -> None:
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            return
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            QMessageBox.warning(self, "Paste", f"Clipboard does not contain valid JSON: {exc}")
+            return
+        items = data if isinstance(data, list) else [data]
+        inserted = 0
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                self.add_step(
+                    AutomationStep(
+                        command=str(entry.get("command", "")),
+                        action_type=str(entry.get("action_type", MacroActionKind.RUN_SHELL.value)),
+                        params=dict(entry.get("params", {})) if isinstance(entry.get("params", {}), dict) else {},
+                        delay_ms=_safe_int(str(entry.get("delay_ms", 0)), 0),
+                        repeat=max(_safe_int(str(entry.get("repeat", 1)), 1), 1),
+                        enabled=bool(entry.get("enabled", True)),
+                        label=str(entry.get("label", "")),
+                    )
+                )
+                inserted += 1
+            except Exception:
+                continue
+        if inserted:
+            self.status.setText(f"Pasted {inserted} step(s)")
+
+    def start_recording(self) -> None:
+        if self.recorder.start():
+            self.record_button.setEnabled(False)
+            self.stop_record_button.setEnabled(True)
+            self.status.setText("Recording mouse actions...")
+
+    def stop_recording(self) -> None:
+        self.recorder.stop()
+        self.record_button.setEnabled(True)
+        self.stop_record_button.setEnabled(False)
+        self.status.setText("Recording stopped")
+
+    def _append_recorded_step(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        action_type = str(payload.get("action_type", MacroActionKind.MOUSE_MOVE.value))
+        params = payload.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        step = AutomationStep(
+            command=str(payload.get("command", "")),
+            action_type=action_type,
+            params=params,
+            delay_ms=_safe_int(str(payload.get("delay_ms", 0)), 0),
+            repeat=max(_safe_int(str(payload.get("repeat", 1)), 1), 1),
+            enabled=bool(payload.get("enabled", True)),
+            label=str(payload.get("label", "")),
+        )
+        self.add_step(step)
+        self.status.setText(f"Recorded {action_type.replace('_', ' ')}")
+
+    def execute_direct(self) -> bool:
+        errors = self.validate_macro(show_dialog=False)
+        if errors:
+            QMessageBox.warning(self, "Automation", "\n".join(errors))
+            return False
+        started = self.runner.start(self.steps(), self._macro_options())
+        if not started:
+            QMessageBox.information(self, "Automation", "Automation is already running.")
+        return started
+
+    def _macro_document(self) -> dict[str, Any]:
+        return {
+            "version": 2,
+            "name": self.macro_name.text().strip() or "Untitled macro",
+            "target_window": asdict(self.target_window()),
+            "options": {
+                "repeat": self.repeat_spin.value(),
+                "loop_forever": self.loop_forever.isChecked(),
+                "confirm_infinite_loops": self.confirm_infinite.isChecked(),
+                "stop_on_error": self.stop_on_error.isChecked(),
+                "continue_on_timeout": self.continue_on_timeout.isChecked(),
+                "stop_on_window_loss": self.stop_on_window_loss.isChecked(),
+                "delay_mode": self.delay_mode.currentText(),
+                "fixed_delay_ms": self.fixed_delay.value(),
+                "random_delay_min_ms": self.random_min.value(),
+                "random_delay_max_ms": self.random_max.value(),
+                "gaussian_mean_ms": self.gaussian_mean.value(),
+                "gaussian_stdev_ms": self.gaussian_stdev.value(),
+                "max_runtime_minutes": self.max_runtime.value(),
+                "max_failures": self.max_failures.value(),
+                "retry_count": self.retry_count.value(),
+                "retry_delay_ms": self.retry_delay.value(),
+            },
+            "actions": [
+                {
+                    "command": step.command,
+                    "action_type": step.action_type,
+                    "params": step.params,
+                    "delay_ms": step.delay_ms,
+                    "repeat": step.repeat,
+                    "enabled": step.enabled,
+                    "label": step.label,
+                }
+                for step in self.steps()
+            ],
+        }
+
+    def _load_macro_data(self, data: dict[str, Any], replace: bool = True) -> None:
+        if not isinstance(data, dict):
+            raise ValueError("Macro data must be a JSON object.")
+        if replace:
+            self.table.setRowCount(0)
+        if isinstance(data.get("name"), str):
+            self.macro_name.setText(data["name"])
+        if isinstance(data.get("target_window"), dict):
+            self.set_target_window(data["target_window"])
+        options = data.get("options", {})
+        if isinstance(options, dict):
+            self.repeat_spin.setValue(_safe_int(str(options.get("repeat", 1)), 1))
+            self.loop_forever.setChecked(bool(options.get("loop_forever", False)))
+            self.confirm_infinite.setChecked(bool(options.get("confirm_infinite_loops", True)))
+            self.stop_on_error.setChecked(bool(options.get("stop_on_error", False)))
+            self.continue_on_timeout.setChecked(bool(options.get("continue_on_timeout", False)))
+            self.stop_on_window_loss.setChecked(bool(options.get("stop_on_window_loss", True)))
+            self.delay_mode.setCurrentText(str(options.get("delay_mode", "fixed")))
+            self.fixed_delay.setValue(_safe_int(str(options.get("fixed_delay_ms", 0)), 0))
+            self.random_min.setValue(_safe_int(str(options.get("random_delay_min_ms", 0)), 0))
+            self.random_max.setValue(_safe_int(str(options.get("random_delay_max_ms", 0)), 0))
+            self.gaussian_mean.setValue(_safe_int(str(options.get("gaussian_mean_ms", 0)), 0))
+            self.gaussian_stdev.setValue(_safe_int(str(options.get("gaussian_stdev_ms", 0)), 0))
+            self.max_runtime.setValue(_safe_int(str(options.get("max_runtime_minutes", 0)), 0))
+            self.max_failures.setValue(_safe_int(str(options.get("max_failures", 0)), 0))
+            self.retry_count.setValue(max(_safe_int(str(options.get("retry_count", 3)), 3), 1))
+            self.retry_delay.setValue(_safe_int(str(options.get("retry_delay_ms", 150)), 150))
+        actions = data.get("actions", [])
+        if isinstance(actions, list):
+            for entry in actions:
+                if isinstance(entry, dict):
+                    self.add_step(
+                        AutomationStep(
+                            command=str(entry.get("command", "")),
+                            action_type=str(entry.get("action_type", MacroActionKind.RUN_SHELL.value)),
+                            params=dict(entry.get("params", {})) if isinstance(entry.get("params", {}), dict) else {},
+                            delay_ms=_safe_int(str(entry.get("delay_ms", 0)), 0),
+                            repeat=max(_safe_int(str(entry.get("repeat", 1)), 1), 1),
+                            enabled=bool(entry.get("enabled", True)),
+                            label=str(entry.get("label", "")),
+                        )
+                    )
+        self.commandChanged.emit()
+
+    def save_macro(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save macro", str(Path.home() / "xdotool-macro.json"), "JSON Files (*.json)")
+        if not path:
+            return
+        Path(path).write_text(json.dumps(self._macro_document(), indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def load_macro(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load macro", str(Path.home()), "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                data = {"actions": data}
+            self._load_macro_data(data, replace=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Automation", f"Unable to load macro: {exc}")
+
+    def import_macro(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import macro", str(Path.home()), "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                data = {"actions": data}
+            self._load_macro_data(data, replace=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Automation", f"Unable to import macro: {exc}")
+
+    def export_macro(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export macro", str(Path.home() / "xdotool-macro.json"), "JSON Files (*.json)")
+        if not path:
+            return
+        Path(path).write_text(json.dumps(self._macro_document(), indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 class AutoClickerTab(BaseCommandTab):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -573,8 +1533,22 @@ class AutoClickerTab(BaseCommandTab):
         self.total_clicks.setValue(0)
         self.order_combo = QComboBox()
         self.order_combo.addItems([item.value for item in CommandOrder])
+        self.movement_style = QComboBox()
+        self.movement_style.addItems(["instant", "smooth", "bezier"])
+        self.ellipse_x_spin = QSpinBox()
+        self.ellipse_x_spin.setRange(0, 10000)
+        self.ellipse_y_spin = QSpinBox()
+        self.ellipse_y_spin.setRange(0, 10000)
+        self.offset_x_spin = QSpinBox()
+        self.offset_x_spin.setRange(0, 10000)
+        self.offset_y_spin = QSpinBox()
+        self.offset_y_spin.setRange(0, 10000)
+        self.bezier_steps = QSpinBox()
+        self.bezier_steps.setRange(2, 100)
+        self.bezier_steps.setValue(16)
         self.counter = QLabel("0")
         self.status = QLabel("idle")
+        self._target_window: dict[str, Any] = {}
         self.positions = QTableWidget(0, 12)
         self.positions.setHorizontalHeaderLabels([
             "Enabled",
@@ -600,7 +1574,7 @@ class AutoClickerTab(BaseCommandTab):
         self.pause_button = QPushButton("Pause")
         self.resume_button = QPushButton("Resume")
         self.stop_button = QPushButton("Stop")
-        self.capture_button = QPushButton("Capture Position")
+        self.capture_button = QPushButton("Record Position")
         self.import_button = QPushButton("Import")
         self.export_button = QPushButton("Export")
         self.save_button = QPushButton("Save")
@@ -615,6 +1589,12 @@ class AutoClickerTab(BaseCommandTab):
         form.addRow("Stop delay ms", self.stop_delay)
         form.addRow("Total clicks", self.total_clicks)
         form.addRow("Order", self.order_combo)
+        form.addRow("Movement style", self.movement_style)
+        form.addRow("Ellipse radius X", self.ellipse_x_spin)
+        form.addRow("Ellipse radius Y", self.ellipse_y_spin)
+        form.addRow("Offset radius X", self.offset_x_spin)
+        form.addRow("Offset radius Y", self.offset_y_spin)
+        form.addRow("Bezier steps", self.bezier_steps)
         top = QWidget()
         top.setLayout(form)
         buttons = QHBoxLayout()
@@ -743,7 +1723,45 @@ class AutoClickerTab(BaseCommandTab):
             start_delay_ms=self.start_delay.value(),
             stop_delay_ms=self.stop_delay.value(),
             total_clicks=self.total_clicks.value(),
+            movement_style=self.movement_style.currentText(),
+            ellipse_radius_x=self.ellipse_x_spin.value(),
+            ellipse_radius_y=self.ellipse_y_spin.value(),
+            offset_radius_x=self.offset_x_spin.value(),
+            offset_radius_y=self.offset_y_spin.value(),
+            bezier_steps=self.bezier_steps.value(),
+            target_window=dict(self._target_window),
         )
+
+    def set_target_window(self, target: dict[str, Any]) -> None:
+        self._target_window = dict(target)
+
+    def load_profile_data(self, data: dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        self.cps_spin.setValue(_safe_float(data.get("clicks_per_second", self.cps_spin.value()), self.cps_spin.value()))
+        self.random_cps.setChecked(bool(data.get("random_cps", self.random_cps.isChecked())))
+        self.loop_forever.setChecked(bool(data.get("loop_forever", self.loop_forever.isChecked())))
+        self.loops_spin.setValue(_safe_int(str(data.get("loops", self.loops_spin.value())), self.loops_spin.value()))
+        self.start_delay.setValue(_safe_int(str(data.get("start_delay_ms", self.start_delay.value())), self.start_delay.value()))
+        self.stop_delay.setValue(_safe_int(str(data.get("stop_delay_ms", self.stop_delay.value())), self.stop_delay.value()))
+        self.total_clicks.setValue(_safe_int(str(data.get("total_clicks", self.total_clicks.value())), self.total_clicks.value()))
+        self.order_combo.setCurrentText(str(data.get("order", self.order_combo.currentText())))
+        self.movement_style.setCurrentText(str(data.get("movement_style", self.movement_style.currentText())))
+        self.ellipse_x_spin.setValue(_safe_int(str(data.get("ellipse_radius_x", self.ellipse_x_spin.value())), self.ellipse_x_spin.value()))
+        self.ellipse_y_spin.setValue(_safe_int(str(data.get("ellipse_radius_y", self.ellipse_y_spin.value())), self.ellipse_y_spin.value()))
+        self.offset_x_spin.setValue(_safe_int(str(data.get("offset_radius_x", self.offset_x_spin.value())), self.offset_x_spin.value()))
+        self.offset_y_spin.setValue(_safe_int(str(data.get("offset_radius_y", self.offset_y_spin.value())), self.offset_y_spin.value()))
+        self.bezier_steps.setValue(max(_safe_int(str(data.get("bezier_steps", self.bezier_steps.value())), self.bezier_steps.value()), 2))
+        self.set_target_window(data.get("target_window", {}))
+        positions = data.get("positions", [])
+        if isinstance(positions, list):
+            self.positions.setRowCount(0)
+            for entry in positions:
+                if isinstance(entry, dict):
+                    try:
+                        self.add_position(ClickPosition(**entry))
+                    except Exception:
+                        continue
 
     def command_spec(self) -> CommandSpec | None:
         if not self.positions.rowCount():
@@ -1083,7 +2101,7 @@ class AppTabs(QTabWidget):
         self.windows = WindowsTab()
         self.desktop = DesktopTab()
         self.typing = TypingTab()
-        self.automation = AutomationTab()
+        self.automation = StructuredAutomationTab()
         self.autoclicker = AutoClickerTab()
         self.terminal = TerminalTab()
         self.history = HistoryTab()

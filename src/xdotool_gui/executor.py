@@ -7,6 +7,7 @@ from datetime import datetime
 from PySide6.QtCore import QObject, QThread, Signal
 
 from .models import CommandSpec, ExecutionResult
+from .services.runtime import XdotoolRunner
 
 
 class _CommandWorker(QThread):
@@ -15,17 +16,12 @@ class _CommandWorker(QThread):
     def __init__(self, spec: CommandSpec) -> None:
         super().__init__()
         self.spec = spec
+        self.runner = XdotoolRunner()
 
     def run(self) -> None:
         started = datetime.now()
         try:
-            proc = subprocess.run(
-                self.spec.argv,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-                check=False,
-            )
+            proc = self.runner.run(self.spec.argv)
             result = ExecutionResult(
                 argv=self.spec.argv,
                 returncode=proc.returncode,

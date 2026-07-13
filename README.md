@@ -8,6 +8,8 @@ It focuses on fast startup, a simple Qt-style interface, and direct command gene
 
 - Keyboard, mouse, window, desktop, typing, automation, terminal, history, presets, and auto-clicker tabs
 - Async command execution through `subprocess`
+- X11-backed window discovery, focus management, and pixel sampling
+- Structured JSON macros with wait-for-pixel and wait-for-window actions
 - Live command preview and copy-to-clipboard support
 - JSON configuration stored in `~/.config/xdotool-gui/`
 - Global hotkeys on X11 via `pynput`
@@ -33,6 +35,7 @@ You need:
 - Linux
 - X11
 - `xdotool`
+- `python-xlib`
 - Python 3.13+
 
 ## Files Worth Reading

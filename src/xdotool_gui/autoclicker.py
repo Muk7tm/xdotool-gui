@@ -4,10 +4,13 @@ import random
 import subprocess
 import threading
 import time
+import math
 
 from PySide6.QtCore import QObject, Signal
 
-from .models import AutoClickerProfile, ClickPosition, CommandOrder
+from .models import AutoClickerProfile, ClickPosition, CommandOrder, WindowTarget
+from .services.runtime import RetryPolicy, XdotoolRunner
+from .services.x11 import X11Inspector
 
 
 class AutoClickerController(QObject):
@@ -23,6 +26,8 @@ class AutoClickerController(QObject):
         self._thread: threading.Thread | None = None
         self._count = 0
         self._active = False
+        self._runner = XdotoolRunner()
+        self._inspector: X11Inspector | None = None
 
     @property
     def active(self) -> bool:
@@ -56,6 +61,7 @@ class AutoClickerController(QObject):
     def _run(self, profile: AutoClickerProfile) -> None:
         ok = True
         try:
+            self._inspector = X11Inspector()
             if profile.start_delay_ms:
                 self._sleep_ms(profile.start_delay_ms)
             loops = 0
@@ -81,6 +87,9 @@ class AutoClickerController(QObject):
         finally:
             if profile.stop_delay_ms:
                 self._sleep_ms(profile.stop_delay_ms)
+            if self._inspector is not None:
+                self._inspector.close()
+                self._inspector = None
             self._active = False
             self.stateChanged.emit("idle")
             self.finished.emit(ok)
@@ -113,17 +122,14 @@ class AutoClickerController(QObject):
                 self._stop.set()
                 break
             self._pause.wait()
-            x = pos.x + random.randint(-pos.random_radius, pos.random_radius) if pos.random_radius else pos.x
-            y = pos.y + random.randint(-pos.random_radius, pos.random_radius) if pos.random_radius else pos.y
-            argv = [
-                "xdotool",
-                "mousemove",
-                str(x),
-                str(y),
-                "click",
-                str(pos.button),
-            ]
-            subprocess.run(argv, check=False)
+            x, y = self._randomized_position(pos, profile)
+            try:
+                self._ensure_target_window(profile)
+                self._move_pointer(x, y, pos, profile)
+                self._run_xdotool(["xdotool", "click", str(pos.button)], profile)
+            except Exception as exc:
+                self.logMessage.emit(f"{pos.name} failed: {exc}")
+                continue
             self._count += 1
             self.counterChanged.emit(self._count)
             self.logMessage.emit(f"{pos.name}: {x},{y} button {pos.button}")
@@ -132,6 +138,92 @@ class AutoClickerController(QObject):
                 wait += random.randint(-pos.jitter_ms, pos.jitter_ms)
             if index < max(pos.clicks, 1) - 1:
                 self._sleep_ms(max(wait, 1))
+
+    def _run_xdotool(self, argv: list[str], profile: AutoClickerProfile) -> None:
+        policy = RetryPolicy(attempts=3, delay_ms=150)
+        result = self._runner.run(argv, policy=policy, logger=self.logMessage.emit)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or f"xdotool failed: {' '.join(argv)}")
+
+    def _ensure_target_window(self, profile: AutoClickerProfile) -> None:
+        inspector = self._inspector
+        if inspector is None or not profile.target_window:
+            return
+        target = WindowTarget(**profile.target_window)
+        resolved = inspector.resolve_target(target)
+        if resolved is None:
+            raise RuntimeError("Auto clicker target window not found.")
+        inspector.focus_window(resolved.window_id)
+
+    def _randomized_position(self, pos: ClickPosition, profile: AutoClickerProfile) -> tuple[int, int]:
+        radius_x = pos.random_radius or profile.offset_radius_x
+        radius_y = pos.random_radius or profile.offset_radius_y
+        if pos.ellipse_radius_x or pos.ellipse_radius_y or profile.ellipse_radius_x or profile.ellipse_radius_y:
+            radius_x = pos.ellipse_radius_x or profile.ellipse_radius_x or radius_x
+            radius_y = pos.ellipse_radius_y or profile.ellipse_radius_y or radius_y
+            angle = random.random() * math.tau
+            return pos.x + int(math.cos(angle) * radius_x), pos.y + int(math.sin(angle) * radius_y)
+        x = pos.x + (random.randint(-radius_x, radius_x) if radius_x else 0)
+        y = pos.y + (random.randint(-radius_y, radius_y) if radius_y else 0)
+        return x, y
+
+    def _move_pointer(self, x: int, y: int, pos: ClickPosition, profile: AutoClickerProfile) -> None:
+        movement_style = (pos.movement_style or profile.movement_style or "instant").lower()
+        if movement_style in {"smooth", "bezier"}:
+            start_x, start_y = self._current_mouse_position()
+            steps = max(pos.bezier_steps or profile.bezier_steps or 16, 2)
+            path = self._bezier_path(start_x, start_y, x, y, steps=steps, curvature=movement_style == "bezier")
+            min_speed = max(pos.movement_speed_min_ms or profile.movement_speed_min_ms, 0)
+            max_speed = max(pos.movement_speed_max_ms or profile.movement_speed_max_ms, min_speed)
+            for point_x, point_y in path:
+                self._run_xdotool(["xdotool", "mousemove", str(point_x), str(point_y)], profile)
+                if max_speed > 0:
+                    self._sleep_ms(random.randint(min_speed, max_speed))
+        else:
+            self._run_xdotool(["xdotool", "mousemove", str(x), str(y)], profile)
+
+    def _current_mouse_position(self) -> tuple[int, int]:
+        inspector = self._inspector
+        if inspector is None:
+            return 0, 0
+        return inspector.pointer_position()
+
+    def _bezier_path(
+        self,
+        start_x: int,
+        start_y: int,
+        end_x: int,
+        end_y: int,
+        *,
+        steps: int,
+        curvature: bool,
+    ) -> list[tuple[int, int]]:
+        mid_x = (start_x + end_x) / 2.0
+        mid_y = (start_y + end_y) / 2.0
+        if curvature:
+            control_1 = (mid_x + (end_y - start_y) * 0.15, mid_y - (end_x - start_x) * 0.15)
+            control_2 = (mid_x - (end_y - start_y) * 0.15, mid_y + (end_x - start_x) * 0.15)
+        else:
+            control_1 = (mid_x, start_y)
+            control_2 = (mid_x, end_y)
+        points: list[tuple[int, int]] = []
+        for index in range(1, steps + 1):
+            t = index / steps
+            inv = 1.0 - t
+            x = (
+                inv * inv * inv * start_x
+                + 3 * inv * inv * t * control_1[0]
+                + 3 * inv * t * t * control_2[0]
+                + t * t * t * end_x
+            )
+            y = (
+                inv * inv * inv * start_y
+                + 3 * inv * inv * t * control_1[1]
+                + 3 * inv * t * t * control_2[1]
+                + t * t * t * end_y
+            )
+            points.append((int(round(x)), int(round(y))))
+        return points
 
     def _sleep_ms(self, ms: int) -> None:
         remaining = ms / 1000.0
