@@ -6,6 +6,20 @@ from enum import Enum
 from typing import Any
 
 
+@dataclass(slots=True)
+class RecorderEvent:
+    timestamp: float
+    type: str
+    x: int | None = None
+    y: int | None = None
+    button: int | None = None
+    key: str | None = None
+    delta: int | None = None
+    modifiers: tuple[str, ...] = ()
+    double_click: bool = False
+    text: str | None = None
+
+
 class CommandCategory(str, Enum):
     KEYBOARD = "keyboard"
     MOUSE = "mouse"

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QCursor
+from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -57,7 +57,7 @@ from .command_builder import (
 )
 from .hotkey_registry import HOTKEY_ACTIONS, hotkey_defaults, normalize_hotkey_bindings
 from .models import AutoClickerProfile, AutomationStep, ClickPosition, CommandSpec, CommandOrder, HistoryEntry, MacroActionKind, PresetEntry, WindowInfo, WindowTarget
-from .services.recorder import MouseMacroRecorder
+from .services.recorder import RecorderService
 from .services.x11 import X11Inspector, parse_color
 
 
@@ -850,6 +850,10 @@ class StructuredAutomationTab(BaseCommandTab):
         self.validate_button = QPushButton("Validate")
         self.copy_button = QPushButton("Copy")
         self.paste_button = QPushButton("Paste")
+        self.cut_button = QPushButton("Cut")
+        self.undo_button = QPushButton("Undo")
+        self.redo_button = QPushButton("Redo")
+        self.record_position_button = QPushButton("Record Position")
         self.record_button = QPushButton("Record Mouse")
         self.stop_record_button = QPushButton("Stop Recording")
         self.stop_record_button.setEnabled(False)
@@ -897,7 +901,7 @@ class StructuredAutomationTab(BaseCommandTab):
         for widget in [self.save_button, self.load_button, self.import_button, self.export_button]:
             file_row.addWidget(widget)
         edit_row = QHBoxLayout()
-        for widget in [self.add_button, self.insert_combo, self.insert_button, self.remove_button, self.duplicate_button, self.copy_button, self.paste_button, self.up_button, self.down_button, self.validate_button]:
+        for widget in [self.add_button, self.insert_combo, self.insert_button, self.remove_button, self.duplicate_button, self.copy_button, self.paste_button, self.cut_button, self.undo_button, self.redo_button, self.record_position_button, self.validate_button]:
             edit_row.addWidget(widget)
         run_row = QHBoxLayout()
         for widget in [self.start_button, self.pause_button, self.resume_button, self.stop_button]:
@@ -954,10 +958,34 @@ class StructuredAutomationTab(BaseCommandTab):
         progress_box = QGroupBox("Progress")
         progress_box.setLayout(progress_form)
 
+        pixel_group = QGroupBox("Pixel Inspector")
+        pixel_layout = QGridLayout(pixel_group)
+        self.pixel_x_label = QLabel("0")
+        self.pixel_y_label = QLabel("0")
+        self.pixel_rgb_label = QLabel("0,0,0")
+        self.pixel_hex_label = QLabel("#000000")
+        self.pixel_preview = QLabel(" ")
+        self.pixel_preview.setMinimumHeight(24)
+        self.pixel_preview.setStyleSheet("border: 1px solid #999; background: #000000;")
+        pixel_layout.addWidget(QLabel("X"), 0, 0)
+        pixel_layout.addWidget(self.pixel_x_label, 0, 1)
+        pixel_layout.addWidget(QLabel("Y"), 0, 2)
+        pixel_layout.addWidget(self.pixel_y_label, 0, 3)
+        pixel_layout.addWidget(QLabel("RGB"), 1, 0)
+        pixel_layout.addWidget(self.pixel_rgb_label, 1, 1, 1, 3)
+        pixel_layout.addWidget(QLabel("HEX"), 2, 0)
+        pixel_layout.addWidget(self.pixel_hex_label, 2, 1, 1, 3)
+        pixel_layout.addWidget(self.pixel_preview, 3, 0, 1, 4)
+        self.pixel_timer = QTimer(self)
+        self.pixel_timer.setInterval(250)
+        self.pixel_timer.timeout.connect(self._update_pixel_inspector)
+        self.pixel_timer.start()
+
         settings_widget = QWidget()
         settings_layout = QVBoxLayout(settings_widget)
         settings_layout.addWidget(target_box)
         settings_layout.addWidget(macro_box)
+        settings_layout.addWidget(pixel_group)
         settings_layout.addWidget(self.record_hint)
         settings_layout.addWidget(self.record_button)
         settings_layout.addWidget(self.stop_record_button)
@@ -993,13 +1021,22 @@ class StructuredAutomationTab(BaseCommandTab):
         layout.addWidget(splitter)
 
         self.runner = MacroRunner(self)
-        self.recorder = MouseMacroRecorder(self)
+        self.recorder = RecorderService(self)
+        self._recorder_timer = QTimer(self)
+        self._recorder_timer.setInterval(100)
+        self._recorder_timer.timeout.connect(self._drain_recorder_events)
+        self._undo_stack: list[dict[str, Any]] = []
+        self._redo_stack: list[dict[str, Any]] = []
+        self._updating_from_history = False
+        self._pending_recorded_steps: list[dict[str, Any]] = []
         self.runner.logMessage.connect(self._set_status)
         self.runner.stateChanged.connect(self.status.setText)
         self.runner.progressChanged.connect(self._update_progress)
         self.runner.failureCountChanged.connect(lambda count: self.status.setText(f"Failures: {count}"))
         self.recorder.stepRecorded.connect(self._append_recorded_step)
-        self.recorder.stateChanged.connect(self.recording_label.setText)
+        self.recorder.eventsRecorded.connect(self._append_recorded_events)
+        self.recorder.stateChanged.connect(self._update_recording_state)
+        self.recorder.statusChanged.connect(self._update_recording_status)
         self.recorder.error.connect(lambda message: QMessageBox.warning(self, "Recorder", message))
 
         self.add_button.clicked.connect(lambda: self.add_step())
@@ -1011,6 +1048,10 @@ class StructuredAutomationTab(BaseCommandTab):
         self.validate_button.clicked.connect(lambda: self.validate_macro(show_dialog=True))
         self.copy_button.clicked.connect(self.copy_selected_steps)
         self.paste_button.clicked.connect(self.paste_steps)
+        self.cut_button.clicked.connect(self.cut_selected_steps)
+        self.undo_button.clicked.connect(self.undo)
+        self.redo_button.clicked.connect(self.redo)
+        self.record_position_button.clicked.connect(self.record_position_into_step)
         self.record_button.clicked.connect(self.start_recording)
         self.stop_record_button.clicked.connect(self.stop_recording)
         self.save_button.clicked.connect(self.save_macro)
@@ -1021,20 +1062,29 @@ class StructuredAutomationTab(BaseCommandTab):
         self.pause_button.clicked.connect(self.runner.pause)
         self.resume_button.clicked.connect(self.runner.resume)
         self.stop_button.clicked.connect(self.runner.stop)
-        self.table.itemChanged.connect(lambda *_: self.commandChanged.emit())
+        self.table.itemChanged.connect(self._handle_table_change)
         self.table.itemSelectionChanged.connect(lambda *_: self.commandChanged.emit())
         self.table.customContextMenuRequested.connect(self._show_table_menu)
+        self._recorder_timer.start()
+        QShortcut(QKeySequence.StandardKey.Undo, self.table, self.undo)
+        QShortcut(QKeySequence.StandardKey.Redo, self.table, self.redo)
+        QShortcut(QKeySequence.StandardKey.Cut, self.table, self.cut_selected_steps)
+        QShortcut(QKeySequence.StandardKey.Copy, self.table, self.copy_selected_steps)
+        QShortcut(QKeySequence.StandardKey.Paste, self.table, self.paste_steps)
+        QShortcut(QKeySequence("Ctrl+D"), self.table, self.duplicate_step)
+        QShortcut(QKeySequence("Delete"), self.table, self.remove_step)
         for widget in [self.macro_name, self.repeat_spin, self.loop_forever, self.confirm_infinite, self.stop_on_error, self.continue_on_timeout, self.stop_on_window_loss, self.delay_mode, self.fixed_delay, self.random_min, self.random_max, self.gaussian_mean, self.gaussian_stdev, self.max_runtime, self.max_failures, self.retry_count, self.retry_delay]:
             if hasattr(widget, "textChanged"):
-                widget.textChanged.connect(lambda *_: self.commandChanged.emit())
+                widget.textChanged.connect(lambda *_: self._handle_form_change())
             elif hasattr(widget, "currentTextChanged"):
-                widget.currentTextChanged.connect(lambda *_: self.commandChanged.emit())
+                widget.currentTextChanged.connect(lambda *_: self._handle_form_change())
             elif hasattr(widget, "valueChanged"):
-                widget.valueChanged.connect(lambda *_: self.commandChanged.emit())
+                widget.valueChanged.connect(lambda *_: self._handle_form_change())
             elif hasattr(widget, "stateChanged"):
-                widget.stateChanged.connect(lambda *_: self.commandChanged.emit())
+                widget.stateChanged.connect(lambda *_: self._handle_form_change())
         self.commandChanged.connect(self._refresh_preview)
         self.add_step()
+        self._push_history()
         self._refresh_preview()
 
     def _set_status(self, text: str) -> None:
@@ -1046,11 +1096,150 @@ class StructuredAutomationTab(BaseCommandTab):
             return MACRO_ACTIONS[index]
         return MacroActionKind.RUN_SHELL.value
 
+    def _push_history(self) -> None:
+        if self._updating_from_history:
+            return
+        snapshot = self._snapshot_state()
+        if self._undo_stack and self._undo_stack[-1] == snapshot:
+            return
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > 50:
+            self._undo_stack = self._undo_stack[-50:]
+        self._redo_stack.clear()
+
+    def _snapshot_state(self) -> dict[str, Any]:
+        return {
+            "name": self.macro_name.text().strip() or "Untitled macro",
+            "target_window": asdict(self.target_window()),
+            "options": {
+                "repeat": self.repeat_spin.value(),
+                "loop_forever": self.loop_forever.isChecked(),
+                "confirm_infinite_loops": self.confirm_infinite.isChecked(),
+                "stop_on_error": self.stop_on_error.isChecked(),
+                "continue_on_timeout": self.continue_on_timeout.isChecked(),
+                "stop_on_window_loss": self.stop_on_window_loss.isChecked(),
+                "delay_mode": self.delay_mode.currentText(),
+                "fixed_delay_ms": self.fixed_delay.value(),
+                "random_delay_min_ms": self.random_min.value(),
+                "random_delay_max_ms": self.random_max.value(),
+                "gaussian_mean_ms": self.gaussian_mean.value(),
+                "gaussian_stdev_ms": self.gaussian_stdev.value(),
+                "max_runtime_minutes": self.max_runtime.value(),
+                "max_failures": self.max_failures.value(),
+                "retry_count": self.retry_count.value(),
+                "retry_delay_ms": self.retry_delay.value(),
+            },
+            "actions": [
+                {
+                    "command": step.command,
+                    "action_type": step.action_type,
+                    "params": step.params,
+                    "delay_ms": step.delay_ms,
+                    "repeat": step.repeat,
+                    "enabled": step.enabled,
+                    "label": step.label,
+                }
+                for step in self.steps()
+            ],
+        }
+
+    def _restore_state(self, snapshot: dict[str, Any]) -> None:
+        self._updating_from_history = True
+        self.table.setRowCount(0)
+        self.macro_name.setText(str(snapshot.get("name", "Untitled macro")))
+        self.set_target_window(snapshot.get("target_window", {}))
+        options = snapshot.get("options", {})
+        if isinstance(options, dict):
+            self.repeat_spin.setValue(_safe_int(str(options.get("repeat", 1)), 1))
+            self.loop_forever.setChecked(bool(options.get("loop_forever", False)))
+            self.confirm_infinite.setChecked(bool(options.get("confirm_infinite_loops", True)))
+            self.stop_on_error.setChecked(bool(options.get("stop_on_error", False)))
+            self.continue_on_timeout.setChecked(bool(options.get("continue_on_timeout", False)))
+            self.stop_on_window_loss.setChecked(bool(options.get("stop_on_window_loss", True)))
+            self.delay_mode.setCurrentText(str(options.get("delay_mode", "fixed")))
+            self.fixed_delay.setValue(_safe_int(str(options.get("fixed_delay_ms", 0)), 0))
+            self.random_min.setValue(_safe_int(str(options.get("random_delay_min_ms", 0)), 0))
+            self.random_max.setValue(_safe_int(str(options.get("random_delay_max_ms", 0)), 0))
+            self.gaussian_mean.setValue(_safe_int(str(options.get("gaussian_mean_ms", 0)), 0))
+            self.gaussian_stdev.setValue(_safe_int(str(options.get("gaussian_stdev_ms", 0)), 0))
+            self.max_runtime.setValue(_safe_int(str(options.get("max_runtime_minutes", 0)), 0))
+            self.max_failures.setValue(_safe_int(str(options.get("max_failures", 0)), 0))
+            self.retry_count.setValue(max(_safe_int(str(options.get("retry_count", 3)), 3), 1))
+            self.retry_delay.setValue(_safe_int(str(options.get("retry_delay_ms", 150)), 150))
+        for entry in snapshot.get("actions", []):
+            if isinstance(entry, dict):
+                self.add_step(
+                    AutomationStep(
+                        command=str(entry.get("command", "")),
+                        action_type=str(entry.get("action_type", MacroActionKind.RUN_SHELL.value)),
+                        params=dict(entry.get("params", {})) if isinstance(entry.get("params", {}), dict) else {},
+                        delay_ms=_safe_int(str(entry.get("delay_ms", 0)), 0),
+                        repeat=max(_safe_int(str(entry.get("repeat", 1)), 1), 1),
+                        enabled=bool(entry.get("enabled", True)),
+                        label=str(entry.get("label", "")),
+                    )
+                )
+        self._updating_from_history = False
+        self.commandChanged.emit()
+
+    def _handle_table_change(self, *_args: Any) -> None:
+        if self._updating_from_history:
+            return
+        self._push_history()
+        self.commandChanged.emit()
+
+    def _handle_form_change(self) -> None:
+        if self._updating_from_history:
+            return
+        self._push_history()
+        self.commandChanged.emit()
+
+    def undo(self) -> None:
+        if len(self._undo_stack) <= 1:
+            return
+        current = self._undo_stack.pop()
+        previous = self._undo_stack[-1]
+        self._redo_stack.append(current)
+        self._restore_state(previous)
+        self.status.setText("Undo")
+
+    def redo(self) -> None:
+        if not self._redo_stack:
+            return
+        next_state = self._redo_stack.pop()
+        self._undo_stack.append(next_state)
+        self._restore_state(next_state)
+        self.status.setText("Redo")
+
+    def _update_pixel_inspector(self) -> None:
+        try:
+            inspector = X11Inspector()
+        except Exception as exc:  # pragma: no cover - environment-specific
+            self.pixel_x_label.setText("-")
+            self.pixel_y_label.setText("-")
+            self.pixel_rgb_label.setText(str(exc))
+            self.pixel_hex_label.setText("-")
+            self.pixel_preview.setStyleSheet("border: 1px solid #999; background: #222;")
+            return
+        try:
+            pos = QCursor.pos()
+            self.pixel_x_label.setText(str(pos.x()))
+            self.pixel_y_label.setText(str(pos.y()))
+            rgb = inspector.pixel_rgb(pos.x(), pos.y())
+            self.pixel_rgb_label.setText(f"{rgb[0]}, {rgb[1]}, {rgb[2]}")
+            hex_color = f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+            self.pixel_hex_label.setText(hex_color)
+            self.pixel_preview.setStyleSheet(f"border: 1px solid #999; background: {hex_color};")
+        except Exception as exc:  # pragma: no cover - environment-specific
+            self.pixel_rgb_label.setText(str(exc))
+        finally:
+            inspector.close()
+
     def _action_combo(self, action_type: str) -> QComboBox:
         combo = QComboBox()
         combo.addItems([MACRO_ACTION_LABELS[action] for action in MACRO_ACTIONS])
         combo.setCurrentIndex(MACRO_ACTIONS.index(action_type) if action_type in MACRO_ACTIONS else 0)
-        combo.currentIndexChanged.connect(lambda *_: self.commandChanged.emit())
+        combo.currentIndexChanged.connect(lambda *_: self._handle_form_change())
         return combo
 
     def _default_template(self, action_type: str) -> tuple[str, dict[str, Any], str]:
@@ -1096,6 +1285,7 @@ class StructuredAutomationTab(BaseCommandTab):
         self.table.setItem(row, 3, QTableWidgetItem(_json_text(step.params if step is not None else params)))
         self.table.setItem(row, 4, QTableWidgetItem(str(step.delay_ms if step is not None else 0)))
         self.table.setItem(row, 5, QTableWidgetItem(str(step.repeat if step is not None else 1)))
+        self._push_history()
         self.commandChanged.emit()
 
     def _current_action_type(self, row: int) -> str:
@@ -1153,6 +1343,7 @@ class StructuredAutomationTab(BaseCommandTab):
         row = self.table.currentRow()
         if row >= 0:
             self.table.removeRow(row)
+            self._push_history()
             self.commandChanged.emit()
 
     def duplicate_step(self) -> None:
@@ -1170,6 +1361,7 @@ class StructuredAutomationTab(BaseCommandTab):
         self._write_step(row, swap)
         self._write_step(other, current)
         self.table.setCurrentCell(other, 0)
+        self._push_history()
         self.commandChanged.emit()
 
     def _validate_step(self, step: AutomationStep) -> list[str]:
@@ -1305,11 +1497,18 @@ class StructuredAutomationTab(BaseCommandTab):
         menu.addAction("Insert Selected", lambda: self.add_step(action_type=self._selected_action_type()))
         menu.addAction("Duplicate", self.duplicate_step)
         menu.addAction("Copy", self.copy_selected_steps)
+        menu.addAction("Cut", self.cut_selected_steps)
         menu.addAction("Paste", self.paste_steps)
+        menu.addSeparator()
+        menu.addAction("Enable", self.enable_selected_steps)
+        menu.addAction("Disable", self.disable_selected_steps)
         menu.addSeparator()
         menu.addAction("Remove", self.remove_step)
         menu.addAction("Move Up", lambda: self.shift_step(-1))
         menu.addAction("Move Down", lambda: self.shift_step(1))
+        menu.addSeparator()
+        menu.addAction("Undo", self.undo)
+        menu.addAction("Redo", self.redo)
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def copy_selected_steps(self) -> None:
@@ -1319,6 +1518,38 @@ class StructuredAutomationTab(BaseCommandTab):
         payload = [asdict(self.step_at(row)) for row in rows]
         QApplication.clipboard().setText(json.dumps(payload, indent=2, ensure_ascii=False))
         self.status.setText("Copied selected steps")
+
+    def cut_selected_steps(self) -> None:
+        self.copy_selected_steps()
+        rows = self._selected_rows()
+        if not rows:
+            return
+        for row in sorted(rows, reverse=True):
+            self.table.removeRow(row)
+        self._push_history()
+        self.commandChanged.emit()
+
+    def enable_selected_steps(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        for row in rows:
+            item = self.table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked)
+        self._push_history()
+        self.commandChanged.emit()
+
+    def disable_selected_steps(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        for row in rows:
+            item = self.table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Unchecked)
+        self._push_history()
+        self.commandChanged.emit()
 
     def paste_steps(self) -> None:
         text = QApplication.clipboard().text().strip()
@@ -1350,13 +1581,39 @@ class StructuredAutomationTab(BaseCommandTab):
             except Exception:
                 continue
         if inserted:
+            self._push_history()
+            self.commandChanged.emit()
             self.status.setText(f"Pasted {inserted} step(s)")
+
+    def record_position_into_step(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            self.add_step()
+            row = self.table.rowCount() - 1
+        pos = QCursor.pos()
+        step = self.step_at(row)
+        params = dict(step.params or {})
+        params["x"] = pos.x()
+        params["y"] = pos.y()
+        updated_step = AutomationStep(
+            command=step.command,
+            action_type=step.action_type,
+            params=params,
+            delay_ms=step.delay_ms,
+            repeat=step.repeat,
+            enabled=step.enabled,
+            label=step.label,
+        )
+        self._write_step(row, updated_step)
+        self._push_history()
+        self.commandChanged.emit()
+        self.status.setText(f"Recorded position {pos.x()}, {pos.y()}")
 
     def start_recording(self) -> None:
         if self.recorder.start():
             self.record_button.setEnabled(False)
             self.stop_record_button.setEnabled(True)
-            self.status.setText("Recording mouse actions...")
+            self.status.setText("Recording...")
 
     def stop_recording(self) -> None:
         self.recorder.stop()
@@ -1364,24 +1621,46 @@ class StructuredAutomationTab(BaseCommandTab):
         self.stop_record_button.setEnabled(False)
         self.status.setText("Recording stopped")
 
+    def _update_recording_state(self, state: str) -> None:
+        self.recording_label.setText(f"Recorder {state}")
+
+    def _update_recording_status(self, text: str) -> None:
+        self.record_hint.setText(text)
+        self.status.setText(text)
+
     def _append_recorded_step(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
-        action_type = str(payload.get("action_type", MacroActionKind.MOUSE_MOVE.value))
-        params = payload.get("params", {})
-        if not isinstance(params, dict):
-            params = {}
-        step = AutomationStep(
-            command=str(payload.get("command", "")),
-            action_type=action_type,
-            params=params,
-            delay_ms=_safe_int(str(payload.get("delay_ms", 0)), 0),
-            repeat=max(_safe_int(str(payload.get("repeat", 1)), 1), 1),
-            enabled=bool(payload.get("enabled", True)),
-            label=str(payload.get("label", "")),
-        )
-        self.add_step(step)
-        self.status.setText(f"Recorded {action_type.replace('_', ' ')}")
+        self._pending_recorded_steps.append(payload)
+
+    def _append_recorded_events(self, payload: object) -> None:
+        if not isinstance(payload, list):
+            return
+        self._pending_recorded_steps.extend(payload)
+
+    def _drain_recorder_events(self) -> None:
+        if not self._pending_recorded_steps:
+            return
+        pending = self._pending_recorded_steps
+        self._pending_recorded_steps = []
+        for payload in pending:
+            if not isinstance(payload, dict):
+                continue
+            action_type = str(payload.get("action_type", MacroActionKind.MOUSE_MOVE.value))
+            params = payload.get("params", {})
+            if not isinstance(params, dict):
+                params = {}
+            step = AutomationStep(
+                command=str(payload.get("command", "")),
+                action_type=action_type,
+                params=params,
+                delay_ms=_safe_int(str(payload.get("delay_ms", 0)), 0),
+                repeat=max(_safe_int(str(payload.get("repeat", 1)), 1), 1),
+                enabled=bool(payload.get("enabled", True)),
+                label=str(payload.get("label", "")),
+            )
+            self.add_step(step)
+        self.status.setText(f"Recorded {len(pending)} event(s)")
 
     def execute_direct(self) -> bool:
         errors = self.validate_macro(show_dialog=False)
